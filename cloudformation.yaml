@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  SharePoint Document Library -> Structured JSON pipeline.
-  Polls a SharePoint document library for images, PDFs, and Word documents,
-  extracts structured data using langextract, and writes JSON to an S3 bucket.
+  REST API-driven SharePoint Document Library -> Structured JSON pipeline.
+  Accepts POST /extract with SharePoint credentials and extraction instructions
+  in the JSON body, downloads documents, extracts structured data using
+  langextract, and writes JSON results to an S3 output bucket.
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -13,47 +14,25 @@ Parameters:
     Default: dev
     AllowedValues: [dev, staging, prod]
 
-  PollingSchedule:
+  ApiStageName:
     Type: String
-    Default: "rate(15 minutes)"
-    Description: EventBridge schedule expression for the SharePoint poller.
-
-  SharePointTenantId:
-    Type: String
-    NoEcho: true
-    Description: Azure AD tenant ID for SharePoint authentication.
-
-  SharePointClientId:
-    Type: String
-    NoEcho: true
-    Description: Azure AD application (client) ID.
-
-  SharePointClientSecret:
-    Type: String
-    NoEcho: true
-    Description: Azure AD application client secret.
-
-  SharePointSiteUrl:
-    Type: String
-    Description: >
-      SharePoint site identifier for Microsoft Graph,
-      e.g. contoso.sharepoint.com:/sites/MySite
-
-  SharePointDocumentLibrary:
-    Type: String
-    Default: Documents
-    Description: Name of the document library to poll.
-
-  ExtractionInstructions:
-    Type: String
-    Description: >
-      JSON string containing extraction instructions:
-      {"prompt_description": "...", "examples": [...], "model_id": "gemini-2.5-flash"}
+    Default: v1
+    Description: API Gateway deployment stage name.
 
   LangExtractApiKey:
     Type: String
     NoEcho: true
-    Description: API key for the LLM provider used by langextract (e.g. Gemini API key).
+    Default: ""
+    Description: >
+      Fallback API key for langextract (e.g. Gemini key).
+      Can also be supplied per-request in the JSON payload.
+
+  ExtractionInstructions:
+    Type: String
+    Default: "{}"
+    Description: >
+      Fallback JSON extraction instructions used when the request payload
+      does not include extraction_instructions.
 
   LambdaCodeBucket:
     Type: String
@@ -116,42 +95,7 @@ Resources:
         - AttributeName: sk
           KeyType: RANGE
 
-  # ---- SSM Parameters (secrets & config) ----------------------------------
-  SSMSharePointTenantId:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/tenant_id"
-      Type: String
-      Value: !Ref SharePointTenantId
-
-  SSMSharePointClientId:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/client_id"
-      Type: String
-      Value: !Ref SharePointClientId
-
-  SSMSharePointClientSecret:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/client_secret"
-      Type: String
-      Value: !Ref SharePointClientSecret
-
-  SSMSharePointSiteUrl:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/site_url"
-      Type: String
-      Value: !Ref SharePointSiteUrl
-
-  SSMSharePointDocumentLibrary:
-    Type: AWS::SSM::Parameter
-    Properties:
-      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/document_library"
-      Type: String
-      Value: !Ref SharePointDocumentLibrary
-
+  # ---- SSM Parameters (fallback secrets) ----------------------------------
   SSMExtractionInstructions:
     Type: AWS::SSM::Parameter
     Properties:
@@ -190,6 +134,7 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                   - s3:ListBucket
+                  - s3:HeadObject
                 Resource:
                   - !GetAtt RawDocumentBucket.Arn
                   - !Sub "${RawDocumentBucket.Arn}/*"
@@ -216,11 +161,11 @@ Resources:
                   - ssm:GetParameters
                 Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/${Environment}/*"
 
-  # ---- SharePoint Poller Lambda -------------------------------------------
+  # ---- SharePoint Ingestion Lambda (API-driven) ---------------------------
   SharePointPollerFunction:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-sharepoint-poller-${Environment}"
+      FunctionName: !Sub "${AWS::StackName}-sharepoint-ingestion-${Environment}"
       Runtime: python3.12
       Handler: sharepoint_poller.handler.handler
       Code:
@@ -235,24 +180,6 @@ Resources:
           RAW_BUCKET: !Ref RawDocumentBucket
           TRACKING_TABLE: !Ref TrackingTable
           LOG_LEVEL: INFO
-
-  PollerScheduleRule:
-    Type: AWS::Events::Rule
-    Properties:
-      Name: !Sub "${AWS::StackName}-poller-schedule-${Environment}"
-      ScheduleExpression: !Ref PollingSchedule
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt SharePointPollerFunction.Arn
-          Id: SharePointPollerTarget
-
-  PollerSchedulePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref SharePointPollerFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt PollerScheduleRule.Arn
 
   # ---- Document Processor Lambda ------------------------------------------
   DocumentProcessorFunction:
@@ -284,10 +211,70 @@ Resources:
       SourceAccount: !Ref AWS::AccountId
       SourceArn: !GetAtt RawDocumentBucket.Arn
 
+  # ---- API Gateway REST API -----------------------------------------------
+  ExtractApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api-${Environment}"
+      Description: REST API for triggering SharePoint document extraction.
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ExtractResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ExtractApi
+      ParentId: !GetAtt ExtractApi.RootResourceId
+      PathPart: extract
+
+  ExtractMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ExtractApi
+      ResourceId: !Ref ExtractResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SharePointPollerFunction.Arn}/invocations"
+
+  # API Gateway needs permission to invoke the Lambda.
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SharePointPollerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExtractApi}/*"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ExtractMethod
+    Properties:
+      RestApiId: !Ref ExtractApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ExtractApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref ApiStageName
+      MethodSettings:
+        - ResourcePath: /extract
+          HttpMethod: POST
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+
 # ---------------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------------
 Outputs:
+  ApiEndpoint:
+    Description: URL of the POST /extract API endpoint.
+    Value: !Sub "https://${ExtractApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/extract"
+
   RawBucketName:
     Description: S3 bucket holding raw documents downloaded from SharePoint.
     Value: !Ref RawDocumentBucket
@@ -300,8 +287,8 @@ Outputs:
     Description: DynamoDB table used for poll-state tracking.
     Value: !Ref TrackingTable
 
-  SharePointPollerArn:
-    Description: ARN of the SharePoint poller Lambda.
+  SharePointIngestionArn:
+    Description: ARN of the SharePoint ingestion Lambda.
     Value: !GetAtt SharePointPollerFunction.Arn
 
   DocumentProcessorArn:

@@ -1,9 +1,9 @@
 """Lambda handler – processes raw documents from S3 using langextract.
 
 Triggered by S3 event notifications when new objects land in the raw/ prefix
-of the raw bucket.  Extracts structured JSON according to the extraction
-instructions stored in SSM Parameter Store, then writes the result to the
-output S3 bucket.
+of the raw bucket.  Reads extraction instructions from a sidecar JSON object
+(written by the API handler) and uses langextract to produce structured JSON
+in the output S3 bucket.
 """
 
 import json
@@ -15,20 +15,12 @@ from pathlib import Path
 import boto3
 import langextract as lx
 
-from shared.config import (
-    get_extraction_instructions,
-    get_langextract_api_key,
-    OUTPUT_BUCKET,
-)
+from shared.config import get_langextract_api_key, OUTPUT_BUCKET
 
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 s3 = boto3.client("s3")
-
-# Document types that need to be read as binary/image vs text extraction.
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}
-DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".doc"}
 
 
 def _download_from_s3(bucket: str, key: str, tmp_dir: str) -> str:
@@ -39,8 +31,14 @@ def _download_from_s3(bucket: str, key: str, tmp_dir: str) -> str:
     return local_path
 
 
+def _load_instructions(bucket: str, instructions_key: str) -> dict:
+    """Load the extraction instructions sidecar from S3."""
+    resp = s3.get_object(Bucket=bucket, Key=instructions_key)
+    return json.loads(resp["Body"].read())
+
+
 def _build_examples(raw_examples: list[dict]) -> list:
-    """Convert plain dicts from SSM config into langextract ExampleData objects."""
+    """Convert plain dicts into langextract ExampleData objects."""
     examples = []
     for ex in raw_examples:
         extractions = [
@@ -55,16 +53,6 @@ def _build_examples(raw_examples: list[dict]) -> list:
             lx.data.ExampleData(text=ex["text"], extractions=extractions)
         )
     return examples
-
-
-def _read_document_text(local_path: str) -> str:
-    """Read text content from a document file.
-
-    For PDFs and Word documents, we read the raw bytes and pass
-    the file path to langextract which handles parsing internally.
-    For images, langextract also accepts file paths directly.
-    """
-    return local_path
 
 
 def _extract(local_path: str, instructions: dict, api_key: str) -> dict:
@@ -103,7 +91,6 @@ def _extract(local_path: str, instructions: dict, api_key: str) -> dict:
 
 def _upload_result(result: dict, original_key: str) -> str:
     """Write the structured JSON to the output bucket."""
-    # Turn  raw/invoice.pdf  ->  processed/invoice.json
     base_name = Path(original_key).stem
     output_key = f"processed/{base_name}.json"
 
@@ -119,8 +106,8 @@ def _upload_result(result: dict, original_key: str) -> str:
 
 def handler(event, context):
     """Entry point for the document-processor Lambda."""
-    instructions = get_extraction_instructions()
-    api_key = get_langextract_api_key()
+    # Fallback API key from SSM (used when the sidecar doesn't include one).
+    fallback_api_key = get_langextract_api_key()
 
     processed = 0
     errors = 0
@@ -132,6 +119,20 @@ def handler(event, context):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             try:
+                # Read S3 object metadata to find the instructions sidecar key.
+                head = s3.head_object(Bucket=bucket, Key=key)
+                metadata = head.get("Metadata", {})
+                instructions_key = metadata.get("instructions_key", "")
+
+                if instructions_key:
+                    instructions = _load_instructions(bucket, instructions_key)
+                    api_key = instructions.pop("langextract_api_key", "") or fallback_api_key
+                else:
+                    # Legacy / fallback: load from SSM.
+                    from shared.config import get_extraction_instructions
+                    instructions = get_extraction_instructions()
+                    api_key = fallback_api_key
+
                 local_path = _download_from_s3(bucket, key, tmp_dir)
                 result = _extract(local_path, instructions, api_key)
                 result["source_file"] = key
