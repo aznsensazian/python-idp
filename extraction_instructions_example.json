@@ -1,0 +1,42 @@
+{
+  "prompt_description": "Extract key data points from the document. For each data point, identify the field name, value, and any relevant context. Use exact text from the document where possible.",
+  "model_id": "gemini-2.5-flash",
+  "examples": [
+    {
+      "text": "Invoice #12345\nDate: 2024-01-15\nBill To: Acme Corp\nTotal: $1,234.56",
+      "extractions": [
+        {
+          "extraction_class": "invoice_number",
+          "extraction_text": "12345",
+          "attributes": {
+            "field": "invoice_number"
+          }
+        },
+        {
+          "extraction_class": "date",
+          "extraction_text": "2024-01-15",
+          "attributes": {
+            "field": "invoice_date",
+            "format": "YYYY-MM-DD"
+          }
+        },
+        {
+          "extraction_class": "entity",
+          "extraction_text": "Acme Corp",
+          "attributes": {
+            "field": "billing_entity",
+            "role": "customer"
+          }
+        },
+        {
+          "extraction_class": "amount",
+          "extraction_text": "$1,234.56",
+          "attributes": {
+            "field": "total_amount",
+            "currency": "USD"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,309 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SharePoint Document Library -> Structured JSON pipeline.
+  Polls a SharePoint document library for images, PDFs, and Word documents,
+  extracts structured data using langextract, and writes JSON to an S3 bucket.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  PollingSchedule:
+    Type: String
+    Default: "rate(15 minutes)"
+    Description: EventBridge schedule expression for the SharePoint poller.
+
+  SharePointTenantId:
+    Type: String
+    NoEcho: true
+    Description: Azure AD tenant ID for SharePoint authentication.
+
+  SharePointClientId:
+    Type: String
+    NoEcho: true
+    Description: Azure AD application (client) ID.
+
+  SharePointClientSecret:
+    Type: String
+    NoEcho: true
+    Description: Azure AD application client secret.
+
+  SharePointSiteUrl:
+    Type: String
+    Description: >
+      SharePoint site identifier for Microsoft Graph,
+      e.g. contoso.sharepoint.com:/sites/MySite
+
+  SharePointDocumentLibrary:
+    Type: String
+    Default: Documents
+    Description: Name of the document library to poll.
+
+  ExtractionInstructions:
+    Type: String
+    Description: >
+      JSON string containing extraction instructions:
+      {"prompt_description": "...", "examples": [...], "model_id": "gemini-2.5-flash"}
+
+  LangExtractApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key for the LLM provider used by langextract (e.g. Gemini API key).
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing the packaged Lambda deployment zips.
+
+  PollerCodeKey:
+    Type: String
+    Default: lambda/sharepoint_poller.zip
+    Description: S3 key for the SharePoint poller Lambda zip.
+
+  ProcessorCodeKey:
+    Type: String
+    Default: lambda/document_processor.zip
+    Description: S3 key for the document processor Lambda zip.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ---- S3 Buckets ---------------------------------------------------------
+  RawDocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-raw-${Environment}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawFiles
+            Status: Enabled
+            ExpirationInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "raw/"
+            Function: !GetAtt DocumentProcessorFunction.Arn
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-output-${Environment}"
+
+  # ---- DynamoDB tracking table --------------------------------------------
+  TrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-tracking-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  # ---- SSM Parameters (secrets & config) ----------------------------------
+  SSMSharePointTenantId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/tenant_id"
+      Type: String
+      Value: !Ref SharePointTenantId
+
+  SSMSharePointClientId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/client_id"
+      Type: String
+      Value: !Ref SharePointClientId
+
+  SSMSharePointClientSecret:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/client_secret"
+      Type: String
+      Value: !Ref SharePointClientSecret
+
+  SSMSharePointSiteUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/site_url"
+      Type: String
+      Value: !Ref SharePointSiteUrl
+
+  SSMSharePointDocumentLibrary:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/${Environment}/sharepoint/document_library"
+      Type: String
+      Value: !Ref SharePointDocumentLibrary
+
+  SSMExtractionInstructions:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/${Environment}/extraction/instructions"
+      Type: String
+      Value: !Ref ExtractionInstructions
+
+  SSMLangExtractApiKey:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${AWS::StackName}/${Environment}/extraction/api_key"
+      Type: String
+      Value: !Ref LangExtractApiKey
+
+  # ---- IAM Role -----------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawDocumentBucket.Arn
+                  - !Sub "${RawDocumentBucket.Arn}/*"
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub "${OutputBucket.Arn}/*"
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt TrackingTable.Arn
+        - PolicyName: SSMAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/${Environment}/*"
+
+  # ---- SharePoint Poller Lambda -------------------------------------------
+  SharePointPollerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-sharepoint-poller-${Environment}"
+      Runtime: python3.12
+      Handler: sharepoint_poller.handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref PollerCodeKey
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          SSM_PARAMETER_PREFIX: !Sub "/${AWS::StackName}/${Environment}"
+          RAW_BUCKET: !Ref RawDocumentBucket
+          TRACKING_TABLE: !Ref TrackingTable
+          LOG_LEVEL: INFO
+
+  PollerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-poller-schedule-${Environment}"
+      ScheduleExpression: !Ref PollingSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SharePointPollerFunction.Arn
+          Id: SharePointPollerTarget
+
+  PollerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SharePointPollerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PollerScheduleRule.Arn
+
+  # ---- Document Processor Lambda ------------------------------------------
+  DocumentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-document-processor-${Environment}"
+      Runtime: python3.12
+      Handler: document_processor.handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref ProcessorCodeKey
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      Environment:
+        Variables:
+          SSM_PARAMETER_PREFIX: !Sub "/${AWS::StackName}/${Environment}"
+          RAW_BUCKET: !Ref RawDocumentBucket
+          OUTPUT_BUCKET: !Ref OutputBucket
+          TRACKING_TABLE: !Ref TrackingTable
+          LOG_LEVEL: INFO
+
+  S3InvokeProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DocumentProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt RawDocumentBucket.Arn
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  RawBucketName:
+    Description: S3 bucket holding raw documents downloaded from SharePoint.
+    Value: !Ref RawDocumentBucket
+
+  OutputBucketName:
+    Description: S3 bucket where structured JSON output is written.
+    Value: !Ref OutputBucket
+
+  TrackingTableName:
+    Description: DynamoDB table used for poll-state tracking.
+    Value: !Ref TrackingTable
+
+  SharePointPollerArn:
+    Description: ARN of the SharePoint poller Lambda.
+    Value: !GetAtt SharePointPollerFunction.Arn
+
+  DocumentProcessorArn:
+    Description: ARN of the document processor Lambda.
+    Value: !GetAtt DocumentProcessorFunction.Arn
